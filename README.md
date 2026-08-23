@@ -11,29 +11,6 @@ python gui_main.py
 
 First launch: create a master password. Cookies are encrypted on disk (AES + PBKDF2).
 
-## Build a GitHub Release (Windows)
-
-Double-click:
-
-```
-build_release.bat
-```
-
-That creates:
-
-```
-RobloxAltManager_Release/
-  RobloxAltManager.exe   ← ready to run (your icon)
-  reset_data.bat         ← one-click wipe before GitHub
-  reset_data.py
-  .gitignore
-  README.txt
-  avatar_cache/
-  accounts.json          ← empty
-  …
-```
-
-Zip `RobloxAltManager_Release` and attach it to a GitHub Release.
 
 ### Before pushing / sharing
 In the release folder (or source folder):
