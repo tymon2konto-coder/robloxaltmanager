@@ -1,0 +1,29 @@
+# Secrets / personal data — never commit these with real content
+accounts.json
+accounts.json.tmp
+*.bak
+*.bak_test
+
+# Runtime / local state (optional: keep empty defaults in repo if you prefer)
+favorites.json
+tabs.json
+config.json
+avatar_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# Personal / machine-specific
+*.lnk
+*.tmp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Virtual env / local installs
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/

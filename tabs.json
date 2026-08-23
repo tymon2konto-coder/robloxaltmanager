@@ -1,0 +1,11 @@
+{
+  "active": "all",
+  "tabs": [
+    {
+      "id": "all",
+      "name": "All",
+      "builtin": true,
+      "accounts": []
+    }
+  ]
+}
