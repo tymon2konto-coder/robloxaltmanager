@@ -1,15 +1,23 @@
 @echo off
-title Reset Roblox Alt Manager data
+title Reset data
 cd /d "%~dp0"
 echo.
-echo  This will wipe accounts, favorites, tabs, config, avatars.
-echo  Safe for uploading a clean copy to GitHub.
+echo  Wipe accounts, favorites, tabs, config, avatars.
+echo  Safe for GitHub after this.
 echo.
-python reset_data.py %*
+where python >nul 2>&1
 if errorlevel 1 (
-  echo.
+  echo Python not found - writing empty data files without Python...
+  echo []> accounts.json
+  echo []> favorites.json
+  echo {"theme":"dark","auto_cookie_refresh":true,"multi_instance":false,"launch_delay":3.0}> config.json
+  echo {"active":"all","tabs":[{"id":"all","name":"All","builtin":true,"accounts":[]}]}> tabs.json
+  if exist avatar_cache rmdir /s /q avatar_cache
+  mkdir avatar_cache
+  echo Done.
   pause
-  exit /b 1
+  exit /b 0
 )
+python reset_data.py %*
 echo.
 pause

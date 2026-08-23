@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import platform
+import sys
 import re
 import subprocess
 import tempfile
@@ -32,11 +33,18 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-ACCOUNTS_FILE = Path(__file__).parent / "accounts.json"
-CONFIG_FILE = Path(__file__).parent / "config.json"
-FAVORITES_FILE = Path(__file__).parent / "favorites.json"
-TABS_FILE = Path(__file__).parent / "tabs.json"
-AVATAR_CACHE_DIR = Path(__file__).parent / "avatar_cache"
+def _app_dir() -> Path:
+    """Writable data dir: next to the EXE when frozen, else the script folder."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+_APP_DIR = _app_dir()
+ACCOUNTS_FILE = _APP_DIR / "accounts.json"
+CONFIG_FILE = _APP_DIR / "config.json"
+FAVORITES_FILE = _APP_DIR / "favorites.json"
+TABS_FILE = _APP_DIR / "tabs.json"
+AVATAR_CACHE_DIR = _APP_DIR / "avatar_cache"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
