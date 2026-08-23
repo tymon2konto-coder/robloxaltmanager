@@ -1,5 +1,6 @@
-<img width="512" height="512" alt="app_icon" src="https://github.com/user-attachments/assets/1889b210-c020-4b57-af87-a8ad956e7db3"
-/># Roblox Alt Manager (Python)
+<img width="512" height="512" alt="app_icon" src="https://github.com/user-attachments/assets/1889b210-c020-4b57-af87-a8ad956e7db3"/>#
+Roblox Alt Manager (Python)
+
 
 Personal Roblox account manager with profile icons, cookie rotation, favorites, and an encrypted cookie vault.
 
