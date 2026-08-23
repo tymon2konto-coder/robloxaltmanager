@@ -1,4 +1,5 @@
-<img width="512" height="512" alt="app_icon" src="https://github.com/user-attachments/assets/1889b210-c020-4b57-af87-a8ad956e7db3" /># Roblox Alt Manager (Python)
+<img width="512" height="512" alt="app_icon" src="https://github.com/user-attachments/assets/1889b210-c020-4b57-af87-a8ad956e7db3"
+/># Roblox Alt Manager (Python)
 
 Personal Roblox account manager with profile icons, cookie rotation, favorites, and an encrypted cookie vault.
 
@@ -40,4 +41,3 @@ Wipes accounts, favorites, tabs, config, avatars. Code/exe stay.
 | `app_icon.ico` | App icon |
 <img width="980" height="587" alt="image" src="https://github.com/user-attachments/assets/eb72713f-fcfc-40cb-8c2a-d0b421447bab" />
 <img width="420" height="484" alt="image" src="https://github.com/user-attachments/assets/2e6257bd-0814-4998-a05a-a9f999657968" />
-<img width="512" height="512" alt="app_icon" src="https://github.com/user-attachments/assets/26c956ba-5d04-4cb6-913a-f1b24f49f79a" />
