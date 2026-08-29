@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
@@ -45,6 +46,10 @@ CONFIG_FILE = _APP_DIR / "config.json"
 FAVORITES_FILE = _APP_DIR / "favorites.json"
 TABS_FILE = _APP_DIR / "tabs.json"
 AVATAR_CACHE_DIR = _APP_DIR / "avatar_cache"
+BROWSER_PROFILES_DIR = _APP_DIR / "browser_profiles"
+INTERACTIVE_TIMEOUT = 6
+AVATAR_CACHE_MAX_AGE = 7 * 24 * 3600  # 7 days
+FRIENDS_CACHE_TTL = 120.0  # seconds
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -216,6 +221,10 @@ def load_config() -> dict:
         "auto_cookie_refresh": True,
         "multi_instance": False,
         "launch_delay": 3.0,  # seconds between multi-account launches
+        "active_place_id": "",
+        "active_job_id": "",
+        "active_link_code": "",
+        "last_visited_servers": [],
     }
     if not CONFIG_FILE.exists():
         return default_config
@@ -447,7 +456,45 @@ def apply_cookie_rotation(
 # ---------------------------------------------------------------------------
 # Roblox API helpers
 # ---------------------------------------------------------------------------
-def make_session(cookie: str) -> requests.Session:
+# Lightweight session reuse for polling / repeated calls with the same cookie.
+# Keyed by a short hash of the cookie so we don't keep secrets in plain keys.
+_SESSION_CACHE: dict[str, tuple[float, "requests.Session"]] = {}
+_SESSION_CACHE_TTL = 90.0  # seconds
+_SESSION_CACHE_MAX = 8
+
+
+def _cookie_cache_key(cookie: str) -> str:
+    # Short stable key — never store the full cookie as a dict key longer than needed
+    return str(hash(cookie[:48] + cookie[-24:] if len(cookie) > 72 else cookie))
+
+
+def make_session(cookie: str, reuse: bool = True) -> requests.Session:
+    """
+    Build a requests.Session with Roblox headers + cookie.
+    When reuse=True (default), return a cached session for the same cookie
+    so connection pooling helps repeated presence/friends/validate calls.
+    """
+    if reuse and cookie:
+        key = _cookie_cache_key(cookie)
+        hit = _SESSION_CACHE.get(key)
+        if hit:
+            ts, sess = hit
+            if time.time() - ts < _SESSION_CACHE_TTL:
+                # Refresh cookie on the session in case it rotated
+                try:
+                    sess.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com")
+                except Exception:
+                    pass
+                _SESSION_CACHE[key] = (time.time(), sess)
+                return sess
+        # Evict oldest if full
+        if len(_SESSION_CACHE) >= _SESSION_CACHE_MAX:
+            oldest = min(_SESSION_CACHE.items(), key=lambda kv: kv[1][0])
+            try:
+                del _SESSION_CACHE[oldest[0]]
+            except KeyError:
+                pass
+
     session = requests.Session()
     session.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com")
     session.headers.update({
@@ -456,7 +503,19 @@ def make_session(cookie: str) -> requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://www.roblox.com",
         "Referer": "https://www.roblox.com/",
+        "Connection": "keep-alive",
     })
+    # Slightly more aggressive pool for parallel refreshes
+    try:
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+    except Exception:
+        pass
+
+    if reuse and cookie:
+        _SESSION_CACHE[_cookie_cache_key(cookie)] = (time.time(), session)
     return session
 
 def validate_cookie(
@@ -466,7 +525,7 @@ def validate_cookie(
 ) -> Optional[dict]:
     session = make_session(cookie)
     try:
-        resp = session.get("https://users.roblox.com/v1/users/authenticated", timeout=15)
+        resp = session.get("https://users.roblox.com/v1/users/authenticated", timeout=INTERACTIVE_TIMEOUT)
         cookie = apply_cookie_rotation(resp, cookie, accounts, user_id)
         if resp.status_code == 200:
             data = resp.json()
@@ -482,7 +541,7 @@ def validate_cookie(
 
 def get_csrf_token(session: requests.Session) -> Optional[str]:
     try:
-        resp = session.post("https://auth.roblox.com/v2/logout", timeout=10)
+        resp = session.post("https://auth.roblox.com/v2/logout", timeout=5)
         token = resp.headers.get("x-csrf-token")
         if token:
             return token
@@ -510,7 +569,7 @@ def get_auth_ticket(
             "https://auth.roblox.com/v1/authentication-ticket",
             headers=headers,
             json={},
-            timeout=15,
+            timeout=8,
         )
         cookie = apply_cookie_rotation(resp, cookie, accounts, user_id)
 
@@ -520,7 +579,7 @@ def get_auth_ticket(
                 "https://auth.roblox.com/v1/authentication-ticket",
                 headers=headers,
                 json={},
-                timeout=15,
+                timeout=8,
             )
             cookie = apply_cookie_rotation(resp, cookie, accounts, user_id)
 
@@ -530,6 +589,300 @@ def get_auth_ticket(
     except Exception as e:
         print(f"[!] Failed to get auth ticket: {e}")
     return None
+
+# ---------------------------------------------------------------------------
+# Friends + presence (online friends for selected account)
+# ---------------------------------------------------------------------------
+_FRIENDS_CACHE: dict[int, tuple[float, list[dict]]] = {}
+
+
+def _resolve_user_names(session: requests.Session, user_ids: list[int]) -> dict[int, dict]:
+    """
+    Batch-resolve username + displayName for user ids.
+    Friends API no longer returns names; users.roblox.com does.
+    Returns {user_id: {"name": str, "displayName": str}}.
+    """
+    out: dict[int, dict] = {}
+    chunk_size = 100
+    for i in range(0, len(user_ids), chunk_size):
+        chunk = [uid for uid in user_ids[i : i + chunk_size] if uid and uid > 0]
+        if not chunk:
+            continue
+        try:
+            resp = session.post(
+                "https://users.roblox.com/v1/users",
+                json={"userIds": chunk, "excludeBannedUsers": False},
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                continue
+            for item in resp.json().get("data") or []:
+                uid = item.get("id")
+                if uid is None:
+                    continue
+                name = (item.get("name") or "").strip()
+                display = (item.get("displayName") or name or "").strip()
+                if not name:
+                    continue
+                out[int(uid)] = {"name": name, "displayName": display or name}
+        except Exception:
+            continue
+    return out
+
+
+def get_friends(cookie: str, user_id: int, use_cache: bool = True) -> list[dict]:
+    """
+    Return friends of user_id: [{"id", "name", "displayName"}, ...].
+    Friend list API only returns ids now; names are resolved via users API.
+    Cached for FRIENDS_CACHE_TTL so presence polls don't re-fetch the graph.
+    """
+    if use_cache:
+        hit = _FRIENDS_CACHE.get(int(user_id))
+        if hit:
+            ts, data = hit
+            if time.time() - ts < FRIENDS_CACHE_TTL:
+                return data
+
+    session = make_session(cookie)
+    friend_ids: list[int] = []
+    try:
+        # Non-paginated endpoint (capped ~200) — still the simplest source of ids
+        resp = session.get(
+            f"https://friends.roblox.com/v1/users/{user_id}/friends",
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            for item in resp.json().get("data") or []:
+                fid = item.get("id")
+                if fid is None:
+                    continue
+                try:
+                    fid_i = int(fid)
+                except (TypeError, ValueError):
+                    continue
+                if fid_i > 0:
+                    friend_ids.append(fid_i)
+
+        # If we hit the cap or got nothing, try paginated /friends/find
+        if len(friend_ids) >= 200 or not friend_ids:
+            cursor = ""
+            seen = set(friend_ids)
+            while True:
+                params: dict = {"limit": 50}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = session.get(
+                    f"https://friends.roblox.com/v1/users/{user_id}/friends/find",
+                    params=params,
+                    timeout=8,
+                )
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                page = data.get("pageItems") or data.get("data") or []
+                for item in page:
+                    fid = item.get("id")
+                    if fid is None:
+                        continue
+                    try:
+                        fid_i = int(fid)
+                    except (TypeError, ValueError):
+                        continue
+                    if fid_i > 0 and fid_i not in seen:
+                        seen.add(fid_i)
+                        friend_ids.append(fid_i)
+                cursor = data.get("nextCursor") or data.get("nextPageCursor") or ""
+                if not cursor or not data.get("hasMore", bool(cursor)):
+                    break
+    except Exception:
+        pass
+
+    if not friend_ids:
+        return []
+
+    names = _resolve_user_names(session, friend_ids)
+    friends: list[dict] = []
+    for fid in friend_ids:
+        info = names.get(fid)
+        if not info:
+            # Skip unresolved ids so the UI never shows bare numbers
+            continue
+        friends.append({
+            "id": fid,
+            "name": info["name"],
+            "displayName": info["displayName"],
+        })
+    _FRIENDS_CACHE[int(user_id)] = (time.time(), friends)
+    return friends
+
+
+def get_presences(cookie: str, user_ids: list[int]) -> dict[int, dict]:
+    """
+    Batch-fetch presence for user_ids.
+    Returns {user_id: {
+        "userPresenceType": int,  # 0 Offline, 1 Online, 2 InGame, 3 InStudio
+        "lastLocation": str,
+        "placeId": int | None,
+        "rootPlaceId": int | None,
+        "gameId": str | None,  # job / server instance id
+        "universeId": int | None,
+    }}
+    """
+    session = make_session(cookie)
+    result: dict[int, dict] = {}
+    # API accepts up to ~100 ids per request
+    chunk_size = 100
+    for i in range(0, len(user_ids), chunk_size):
+        chunk = user_ids[i : i + chunk_size]
+        if not chunk:
+            continue
+        try:
+            resp = session.post(
+                "https://presence.roblox.com/v1/presence/users",
+                json={"userIds": chunk},
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                continue
+            for item in (resp.json().get("userPresences") or []):
+                uid = item.get("userId")
+                if uid is None:
+                    continue
+                result[int(uid)] = {
+                    "userPresenceType": int(item.get("userPresenceType") or 0),
+                    "lastLocation": item.get("lastLocation") or "",
+                    "placeId": item.get("placeId"),
+                    "rootPlaceId": item.get("rootPlaceId"),
+                    "gameId": item.get("gameId") or item.get("gameInstanceId"),
+                    "universeId": item.get("universeId"),
+                }
+        except Exception:
+            continue
+    return result
+
+
+def get_online_friends(cookie: str, user_id: int) -> list[dict]:
+    """
+    Friends who are InGame only (not idle on site), with presence details for joining.
+    Each entry:
+      {
+        "id", "name", "displayName",
+        "userPresenceType", "lastLocation",
+        "placeId", "rootPlaceId", "gameId", "universeId",
+        "game_name",  # best-effort label for UI
+      }
+    Sorted: InGame first, then Online.
+    """
+    friends = get_friends(cookie, user_id)
+    if not friends:
+        return []
+    ids = [f["id"] for f in friends]
+    presences = get_presences(cookie, ids)
+    online: list[dict] = []
+    for f in friends:
+        p = presences.get(f["id"])
+        if not p:
+            continue
+        ptype = p.get("userPresenceType", 0)
+        # Only friends actually in a game — not idle on site / Studio
+        if ptype != 2:
+            continue
+        game_name = (p.get("lastLocation") or "").strip() or "In game"
+        online.append({
+            "id": f["id"],
+            "name": f["name"],
+            "displayName": f["displayName"],
+            "userPresenceType": ptype,
+            "lastLocation": p.get("lastLocation") or "",
+            "placeId": p.get("placeId"),
+            "rootPlaceId": p.get("rootPlaceId"),
+            "gameId": p.get("gameId"),
+            "universeId": p.get("universeId"),
+            "game_name": game_name,
+        })
+    online.sort(key=lambda x: x["displayName"].lower())
+    return online
+
+
+def get_public_servers(
+    place_id: int,
+    cookie: str = "",
+    limit: int = 100,
+    cursor: str = "",
+) -> tuple[list[dict], str]:
+    """
+    List public servers for a place (one page).
+    Returns (servers, next_cursor).
+    Each server: {"id" (job id), "playing", "maxPlayers", "ping", "fps"}
+    Sorted most relevant first: higher player count, then lower ping.
+    """
+    session = make_session(cookie) if cookie else requests.Session()
+    if not cookie:
+        session.headers.update({"User-Agent": USER_AGENT})
+    servers: list[dict] = []
+    next_cursor = ""
+    try:
+        params: dict = {
+            "sortOrder": "Desc",  # more populated first when API supports it
+            "limit": min(100, max(10, limit)),
+        }
+        if cursor:
+            params["cursor"] = cursor
+        resp = session.get(
+            f"https://games.roblox.com/v1/games/{place_id}/servers/Public",
+            params=params,
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for item in data.get("data") or []:
+                job_id = item.get("id")
+                if not job_id:
+                    continue
+                servers.append({
+                    "id": str(job_id),
+                    "playing": int(item.get("playing") or 0),
+                    "maxPlayers": int(item.get("maxPlayers") or 0),
+                    "ping": item.get("ping"),
+                    "fps": item.get("fps"),
+                })
+            next_cursor = data.get("nextPageCursor") or ""
+    except Exception:
+        pass
+    # Client-side relevance: active servers first (most players), then best ping
+    def relevance(s: dict):
+        ping = s.get("ping")
+        ping_k = int(ping) if isinstance(ping, (int, float)) else 5_000
+        return (-s.get("playing", 0), ping_k)
+    servers.sort(key=relevance)
+    return servers, next_cursor
+
+
+def pick_fast_server(servers: list[dict]) -> Optional[dict]:
+    """Prefer lowest ping; fall back to highest fps, then fewest players."""
+    if not servers:
+        return None
+    def key(s: dict):
+        ping = s.get("ping")
+        fps = s.get("fps")
+        # Missing ping sorts last
+        ping_k = int(ping) if isinstance(ping, (int, float)) else 10_000
+        fps_k = -float(fps) if isinstance(fps, (int, float)) else 0
+        return (ping_k, fps_k, s.get("playing", 0))
+    return min(servers, key=key)
+
+
+def pick_small_server(servers: list[dict]) -> Optional[dict]:
+    """Fewest players; prefer not full."""
+    if not servers:
+        return None
+    open_servers = [
+        s for s in servers
+        if s.get("maxPlayers", 0) <= 0 or s.get("playing", 0) < s.get("maxPlayers", 0)
+    ]
+    pool = open_servers or servers
+    return min(pool, key=lambda s: (s.get("playing", 0), s.get("ping") or 10_000))
+
 
 # ---------------------------------------------------------------------------
 # Game / Place info (for favorites)
@@ -594,52 +947,74 @@ def get_place_info(place_id: int) -> Optional[dict]:
     return None
 
 # ---------------------------------------------------------------------------
-# Profile pictures – always re-check on launch
+# Profile pictures
 # ---------------------------------------------------------------------------
 def get_avatar_headshot_url(user_id: int, size: str = "48x48") -> Optional[str]:
-    try:
-        resp = requests.get(
-            "https://thumbnails.roblox.com/v1/users/avatar-headshot",
-            params={
-                "userIds": str(user_id),
-                "size": size,
-                "format": "Png",
-                "isCircular": "false",
-            },
-            timeout=10,
-            headers={"User-Agent": USER_AGENT},
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("data"):
-                item = data["data"][0]
-                if item.get("state") == "Completed" and item.get("imageUrl"):
-                    return item["imageUrl"]
-    except Exception:
-        pass
-    return None
+    urls = get_avatar_headshot_urls([user_id], size=size)
+    return urls.get(int(user_id))
+
+
+def get_avatar_headshot_urls(user_ids: list[int], size: str = "48x48") -> dict[int, str]:
+    """
+    Batch-fetch avatar headshot URLs (thumbnails API accepts many userIds).
+    Returns {user_id: imageUrl} for Completed entries only.
+    """
+    out: dict[int, str] = {}
+    ids = [int(u) for u in user_ids if u]
+    if not ids:
+        return out
+    chunk_size = 100
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i : i + chunk_size]
+        try:
+            resp = requests.get(
+                "https://thumbnails.roblox.com/v1/users/avatar-headshot",
+                params={
+                    "userIds": ",".join(str(u) for u in chunk),
+                    "size": size,
+                    "format": "Png",
+                    "isCircular": "false",
+                },
+                timeout=12,
+                headers={"User-Agent": USER_AGENT},
+            )
+            if resp.status_code != 200:
+                continue
+            for item in (resp.json().get("data") or []):
+                if item.get("state") != "Completed":
+                    continue
+                url = item.get("imageUrl")
+                target = item.get("targetId")
+                if url and target is not None:
+                    out[int(target)] = url
+        except Exception:
+            continue
+    return out
+
 
 def download_avatar(user_id: int, size: str = "48x48", force: bool = False) -> Optional[Path]:
     """
     Download and cache avatar headshot.
-    force=True → always re-download (used on every app launch).
+    Disk cache is trusted for AVATAR_CACHE_MAX_AGE unless force=True.
+    force still skips a re-download if the file is under 5 minutes old.
     """
     AVATAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = AVATAR_CACHE_DIR / f"{user_id}_{size}.png"
 
-    if not force and cache_path.exists() and cache_path.stat().st_size > 100:
-        # Still allow short-term reuse within same session; force handles launch
-        if time.time() - cache_path.stat().st_mtime < 300:  # 5 min
+    if cache_path.exists() and cache_path.stat().st_size > 100:
+        age = time.time() - cache_path.stat().st_mtime
+        if not force and age < AVATAR_CACHE_MAX_AGE:
+            return cache_path
+        if force and age < 300:
             return cache_path
 
     url = get_avatar_headshot_url(user_id, size)
     if not url:
-        # Keep old file if download fails
         if cache_path.exists() and cache_path.stat().st_size > 100:
             return cache_path
         return None
     try:
-        r = requests.get(url, timeout=15, headers={"User-Agent": USER_AGENT})
+        r = requests.get(url, timeout=12, headers={"User-Agent": USER_AGENT})
         if r.status_code == 200 and r.content:
             cache_path.write_bytes(r.content)
             return cache_path
@@ -649,13 +1024,50 @@ def download_avatar(user_id: int, size: str = "48x48", force: bool = False) -> O
         return cache_path
     return None
 
-def refresh_all_avatars(user_ids: list[int]) -> None:
-    """Force re-download avatars for the given user IDs (called on launch)."""
-    for uid in user_ids:
+
+def refresh_all_avatars(user_ids: list[int], force: bool = False) -> None:
+    """
+    Fill missing/stale avatars.
+    Batches the thumbnails API call, then downloads only the images that are
+    missing or stale — so network work is minimal and parallel.
+    """
+    ids = [int(uid) for uid in user_ids if uid]
+    if not ids:
+        return
+
+    AVATAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    size = "48x48"
+    need: list[int] = []
+    for uid in ids:
+        cache_path = AVATAR_CACHE_DIR / f"{uid}_{size}.png"
+        if cache_path.exists() and cache_path.stat().st_size > 100:
+            age = time.time() - cache_path.stat().st_mtime
+            if not force and age < AVATAR_CACHE_MAX_AGE:
+                continue
+            if force and age < 300:
+                continue
+        need.append(uid)
+
+    if not need:
+        return
+
+    urls = get_avatar_headshot_urls(need, size=size)
+
+    def one(uid: int) -> None:
+        url = urls.get(uid)
+        if not url:
+            return
+        cache_path = AVATAR_CACHE_DIR / f"{uid}_{size}.png"
         try:
-            download_avatar(uid, size="48x48", force=True)
+            r = requests.get(url, timeout=12, headers={"User-Agent": USER_AGENT})
+            if r.status_code == 200 and r.content:
+                cache_path.write_bytes(r.content)
         except Exception:
             pass
+
+    workers = min(10, max(1, len(need)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(one, need))
 
 # ---------------------------------------------------------------------------
 # Launching
@@ -898,42 +1310,242 @@ def release_multi_instance() -> None:
 # ---------------------------------------------------------------------------
 # Browser login
 # ---------------------------------------------------------------------------
-def login_with_browser(timeout_seconds: int = 300) -> Optional[dict]:
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.edge.options import Options
-    except ImportError:
-        print("[!] Missing dependency. Run: pip install selenium")
-        return None
+_LIVE_DRIVERS: list = []
+
+
+def _edge_options_fast(profile_dir: str):
+    """Edge options tuned for fast cold-start (login / open session)."""
+    from selenium.webdriver.edge.options import Options
 
     options = Options()
-    temp_profile_dir = tempfile.mkdtemp(prefix="roblox_login_")
-    options.add_argument(f"--user-data-dir={temp_profile_dir}")
-    options.add_argument("--window-size=800,600")
+    options.add_argument(f"--user-data-dir={profile_dir}")
+    options.add_argument("--window-size=960,700")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    # Startup noise / background junk
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-breakpad")
+    options.add_argument("--disable-client-side-phishing-detection")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-hang-monitor")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-prompt-on-repost")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-translate")
+    options.add_argument("--metrics-recording-only")
+    options.add_argument("--no-first-run")
+    options.add_argument("--password-store=basic")
+    options.add_argument("--use-mock-keychain")
+    options.add_argument("--disable-features=TranslateUI,MediaRouter,ImprovedCookieControls,CalculateNativeWinOcclusion")
+    # Faster network / rendering path (safe for Roblox web)
+    options.add_argument("--enable-features=NetworkServiceInProcess2")
+    options.add_argument("--disable-ipc-flooding-protection")
+    options.add_argument("--renderer-process-limit=3")
+    options.add_argument("--js-flags=--lite-mode")
+    options.add_argument("--disable-component-update")
+    options.add_argument("--disable-domain-reliability")
+    options.add_argument("--disable-features=AudioServiceOutOfProcess")
+    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    options.add_experimental_option("useAutomationExtension", False)
+    # Eager: DOM ready is enough; images/scripts can finish after we inject cookies
+    options.page_load_strategy = "eager"
+    prefs = {
+        "profile.default_content_setting_values.notifications": 2,
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+        # Prefer HTTP/2 / QUIC where available
+        "webkit.webprefs.loads_images_automatically": True,
+    }
+    options.add_experimental_option("prefs", prefs)
+    return options
 
-    try:
-        driver = webdriver.Edge(options=options)
-    except Exception as e:
-        print(f"[!] Could not start browser: {e}")
-        return None
 
+def _stealth_webdriver_bit(driver) -> None:
     try:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {
-                "source": """
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    })
+                "source": (
+                    "Object.defineProperty(navigator, 'webdriver', "
+                    "{get: () => undefined});"
+                )
+            },
+        )
+    except Exception:
+        pass
+    # Block common analytics / ad hosts that slow first paint (Roblox itself stays)
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd(
+            "Network.setBlockedURLs",
+            {
+                "urls": [
+                    "*google-analytics.com*",
+                    "*googletagmanager.com*",
+                    "*doubleclick.net*",
+                    "*facebook.net*",
+                    "*scorecardresearch.com*",
+                    "*hotjar.com*",
+                    "*sentry.io*",
+                    "*fullstory.com*",
+                    "*newrelic.com*",
+                    "*nr-data.net*",
+                ]
+            },
+        )
+    except Exception:
+        pass
+
+
+def _start_edge_fast(temp_prefix: str, persist_name: str | None = None):
+    from selenium import webdriver
+    from selenium.webdriver.edge.service import Service
+
+    if persist_name:
+        profile_path = BROWSER_PROFILES_DIR / persist_name
+        profile_path.mkdir(parents=True, exist_ok=True)
+        profile_dir = str(profile_path)
+    else:
+        profile_dir = tempfile.mkdtemp(prefix=temp_prefix)
+
+    options = _edge_options_fast(profile_dir)
+    try:
+        service = Service(log_output=os.devnull)
+    except TypeError:
+        service = Service()
+    try:
+        driver = webdriver.Edge(options=options, service=service)
+    except TypeError:
+        driver = webdriver.Edge(options=options)
+    _stealth_webdriver_bit(driver)
+    try:
+        # Eager strategy + lower timeout = feel faster on good connections
+        driver.set_page_load_timeout(12)
+        driver.set_script_timeout(8)
+    except Exception:
+        pass
+    _LIVE_DRIVERS.append(driver)
+    return driver
+
+
+def _quit_driver(driver) -> None:
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    try:
+        _LIVE_DRIVERS.remove(driver)
+    except ValueError:
+        pass
+
+
+def close_managed_browsers() -> None:
+    """Quit Edge sessions this app started (called on exit)."""
+    drivers = list(_LIVE_DRIVERS)
+    _LIVE_DRIVERS.clear()
+    for driver in drivers:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+def _inject_roblox_consent_cookies(driver) -> None:
+    """
+    Pre-set Roblox-only cookie-consent so the banner doesn't ask every session.
+    Roblox stores consent in `RBXcb` (see their site scripts: consentCookieName).
+    """
+    # Accept-all style payload; categories Roblox's banner uses in the consent string
+    rbxcb_value = (
+        "Essential=true&Functional=true&Analytics=true&Advertising=true"
+    )
+    expires = int(time.time()) + 180 * 24 * 3600  # matches ~180-day site default
+    consent_cookies = [
+        {
+            "name": "RBXcb",
+            "value": rbxcb_value,
+            "domain": ".roblox.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "expires": expires,
+        },
+        # Harmless extras some regional Roblox stacks still check
+        {
+            "name": "OptanonAlertBoxClosed",
+            "value": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "domain": ".roblox.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "expires": expires,
+        },
+    ]
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+    except Exception:
+        pass
+    for c in consent_cookies:
+        try:
+            driver.execute_cdp_cmd("Network.setCookie", c)
+        except Exception:
+            pass
+    # Hide leftover banner nodes on roblox.com only (doesn't touch other sites)
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": r"""
+                (function () {
+                  try {
+                    var h = location.hostname || '';
+                    if (h.indexOf('roblox.com') === -1) return;
+                    var hide = function () {
+                      var nodes = document.querySelectorAll(
+                        '#cookie-banner-wrapper, [id*="cookie-banner"], [class*="cookie-banner"], [class*="CookieBanner"], #onetrust-banner-sdk, #onetrust-consent-sdk'
+                      );
+                      for (var i = 0; i < nodes.length; i++) {
+                        nodes[i].style.setProperty('display', 'none', 'important');
+                      }
+                    };
+                    if (document.readyState === 'loading') {
+                      document.addEventListener('DOMContentLoaded', hide);
+                    } else {
+                      hide();
+                    }
+                    setTimeout(hide, 500);
+                    setTimeout(hide, 1500);
+                  } catch (e) {}
+                })();
                 """
             },
         )
     except Exception:
         pass
 
-    driver.get("https://www.roblox.com/login")
+
+def login_with_browser(timeout_seconds: int = 300) -> Optional[dict]:
+    try:
+        from selenium import webdriver  # noqa: F401 — presence check
+    except ImportError:
+        print("[!] Missing dependency. Run: pip install selenium")
+        return None
+
+    try:
+        driver = _start_edge_fast("roblox_login_", persist_name="login")
+    except Exception as e:
+        print(f"[!] Could not start browser: {e}")
+        return None
+
+    _inject_roblox_consent_cookies(driver)
+
+    try:
+        driver.get("https://www.roblox.com/login")
+    except Exception:
+        pass
 
     start = time.time()
     cookie_value = None
@@ -947,28 +1559,18 @@ def login_with_browser(timeout_seconds: int = 300) -> Optional[dict]:
             if cookie_value:
                 break
         except Exception:
+            _quit_driver(driver)
             return None
-        time.sleep(1.5)
+        time.sleep(0.35)
+
+    _quit_driver(driver)
 
     if not cookie_value:
-        try:
-            driver.quit()
-        except Exception:
-            pass
         return None
 
     info = validate_cookie(cookie_value)
     if not info:
-        try:
-            driver.quit()
-        except Exception:
-            pass
         return None
-
-    try:
-        driver.quit()
-    except Exception:
-        pass
 
     return {
         "cookie": info.get("cookie", cookie_value),
@@ -977,63 +1579,92 @@ def login_with_browser(timeout_seconds: int = 300) -> Optional[dict]:
         "displayName": info["displayName"],
     }
 
+
 def open_browser_for_account(account: Account) -> bool:
+    """Open Edge already logged in — one navigation, cookie set via CDP (no double load)."""
     try:
-        from selenium import webdriver
-        from selenium.webdriver.edge.options import Options
+        from selenium import webdriver  # noqa: F401
     except ImportError:
         return False
 
-    options = Options()
-    temp_profile_dir = tempfile.mkdtemp(prefix="roblox_session_")
-    options.add_argument(f"--user-data-dir={temp_profile_dir}")
-    options.add_argument("--window-size=800,600")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-
     try:
-        driver = webdriver.Edge(options=options)
+        driver = _start_edge_fast(
+            "roblox_session_",
+            persist_name=f"session_{account.user_id}",
+        )
     except Exception:
         return False
 
     try:
-        driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {
-                "source": """
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    })
-                """
-            },
-        )
-    except Exception:
-        pass
+        # Consent first (Roblox only), then session cookie — one navigation to home
+        _inject_roblox_consent_cookies(driver)
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.execute_cdp_cmd(
+                "Network.setCookie",
+                {
+                    "name": ".ROBLOSECURITY",
+                    "value": account.cookie,
+                    "domain": ".roblox.com",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                },
+            )
+        except Exception:
+            try:
+                driver.get("https://www.roblox.com/favicon.ico")
+                driver.add_cookie({
+                    "name": ".ROBLOSECURITY",
+                    "value": account.cookie,
+                    "domain": ".roblox.com",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                })
+            except Exception:
+                pass
 
-    driver.get("https://www.roblox.com")
-    driver.add_cookie({
-        "name": ".ROBLOSECURITY",
-        "value": account.cookie,
-        "domain": ".roblox.com",
-        "path": "/",
-        "secure": True,
-        "httpOnly": True,
-    })
-    driver.refresh()
-    return True
+        try:
+            driver.get("https://www.roblox.com/home")
+        except Exception:
+            pass
+        return True
+    except Exception:
+        _quit_driver(driver)
+        return False
 
 # ---------------------------------------------------------------------------
 # Auto cookie refresh
 # ---------------------------------------------------------------------------
 def refresh_all_cookies(accounts: list[Account]) -> tuple[int, int, list[str]]:
+    """Validate cookies in parallel. One save at the end (no per-account disk writes)."""
+    if not accounts:
+        return 0, 0, []
+
+    def one(acc: Account) -> tuple[int, Optional[dict]]:
+        info = validate_cookie(acc.cookie, accounts=None, user_id=None)
+        return acc.user_id, info
+
+    results: dict[int, Optional[dict]] = {}
+    workers = min(12, max(1, len(accounts)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(one, acc) for acc in accounts]
+        for fut in as_completed(futs):
+            try:
+                uid, info = fut.result()
+                results[uid] = info
+            except Exception:
+                continue
+
     valid = 0
     invalid: list[str] = []
     for acc in accounts:
-        info = validate_cookie(acc.cookie, accounts=accounts, user_id=acc.user_id)
+        info = results.get(acc.user_id)
         if info:
             acc.username = info["name"]
             acc.display_name = info["displayName"]
-            if "cookie" in info:
+            if info.get("cookie"):
                 acc.cookie = info["cookie"]
             acc.last_validated = time.time()
             valid += 1

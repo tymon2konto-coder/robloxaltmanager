@@ -2,5 +2,9 @@
   "theme": "dark",
   "auto_cookie_refresh": true,
   "multi_instance": false,
-  "launch_delay": 3.0
+  "launch_delay": 3.0,
+  "active_place_id": "",
+  "active_job_id": "",
+  "active_link_code": "",
+  "last_visited_servers": []
 }

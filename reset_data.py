@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Wipe personal / runtime data so this folder is safe for GitHub or sharing.
-Keeps the EXE and app files. Deletes accounts, favorites, tabs, config, avatars.
+Keeps the EXE and app files. Deletes accounts, favorites, tabs, config,
+avatars, browser profiles, lock files, and temp junk.
 """
 from __future__ import annotations
 import argparse
@@ -17,6 +18,10 @@ DEFAULT_CONFIG = {
     "auto_cookie_refresh": True,
     "multi_instance": False,
     "launch_delay": 3.0,
+    "active_place_id": "",
+    "active_job_id": "",
+    "active_link_code": "",
+    "last_visited_servers": [],
 }
 DEFAULT_TABS = {
     "active": "all",
@@ -28,8 +33,14 @@ FILES = {
     "tabs.json": DEFAULT_TABS,
     "config.json": DEFAULT_CONFIG,
 }
-DIRS = ["avatar_cache", "__pycache__"]
-GLOBS = ["*.lnk", "*.tmp", "*.bak", "*.bak_test", "*.pyc", "accounts.json.tmp"]
+# Wipe these directories completely (recreate empty)
+DIRS = ["avatar_cache", "browser_profiles", "__pycache__"]
+# Extra single files to delete if present
+EXTRA_FILES = [
+    ".roblox_alt_manager.lock",
+    "accounts.json.tmp",
+]
+GLOBS = ["*.lnk", "*.tmp", "*.bak", "*.bak_test", "*.pyc", "*.log"]
 
 
 def main() -> int:
@@ -37,7 +48,8 @@ def main() -> int:
     ap.add_argument("--yes", "-y", action="store_true")
     args = ap.parse_args()
     if not args.yes:
-        print("This will permanently wipe accounts/cookies, favorites, tabs, config, avatars.")
+        print("This will permanently wipe accounts/cookies, favorites, tabs,")
+        print("config, avatars, browser profiles, and lock files.")
         if input("Type YES to continue: ").strip() != "YES":
             print("Cancelled.")
             return 1
@@ -48,14 +60,14 @@ def main() -> int:
     for name in DIRS:
         d = ROOT / name
         if d.is_dir():
-            for c in list(d.iterdir()):
-                if c.is_file():
-                    c.unlink(missing_ok=True)
-                else:
-                    shutil.rmtree(c, ignore_errors=True)
-        else:
-            d.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True, exist_ok=True)
         print(f"  cleared {name}/")
+    for name in EXTRA_FILES:
+        p = ROOT / name
+        if p.is_file():
+            p.unlink(missing_ok=True)
+            print(f"  deleted {name}")
     for pattern in GLOBS:
         for p in ROOT.glob(pattern):
             if p.is_file():
